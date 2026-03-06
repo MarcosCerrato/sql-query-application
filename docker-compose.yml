@@ -1,0 +1,127 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: sales
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d sales"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_KEEP_ALIVE: -1
+    volumes:
+      - ollama_data:/root/.ollama
+    # Pull both models on startup, then keep serving
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        sleep 5
+        ollama pull ${OLLAMA_MODEL:-qwen2.5-coder:7b}
+        wait
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q ${OLLAMA_MODEL:-qwen2.5-coder:7b}"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 600s
+    networks:
+      - backend
+
+  db-service:
+    build: ./db-service
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/sales
+    volumes:
+      - ./data.csv:/data/data.csv:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
+
+  model-service:
+    build: ./model-service
+    logging:
+      driver: "none"
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5-coder:7b}
+      DB_SERVICE_URL: http://db-service:8000
+      ANSWER_SERVICE_URL: http://answer-service:8002
+    depends_on:
+      db-service:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      answer-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ports:
+      - "8001:8001"
+    networks:
+      - backend
+
+  answer-service:
+    build: ./answer-service
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_ANSWER_MODEL:-qwen2.5-coder:7b}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ports:
+      - "8002:8002"
+    networks:
+      - backend
+
+  frontend-react:
+    build:
+      context: ./frontend-react
+      args:
+        VITE_API_URL: http://localhost:8001
+    depends_on:
+      model-service:
+        condition: service_healthy
+    ports:
+      - "5173:5173"
+    networks:
+      - backend
+
+volumes:
+  postgres_data:
+  ollama_data:
+
+networks:
+  backend:
+    driver: bridge

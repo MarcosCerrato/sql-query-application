@@ -1,0 +1,55 @@
+# Few-shots for the `sales` table
+# Columns: id, date (DATE), week_day (VARCHAR), hour (TIME),
+#           ticket_number (VARCHAR), waiter (INTEGER), product_name (VARCHAR),
+#           quantity (INTEGER), unitary_price (NUMERIC), total (NUMERIC)
+
+- question: "What is the best-selling product?"
+  sql: "SELECT product_name, SUM(quantity) AS total_qty FROM sales GROUP BY product_name ORDER BY total_qty DESC LIMIT 1;"
+
+- question: "How many sales were there per day of the week?"
+  sql: "SELECT week_day, COUNT(*) AS sales FROM sales GROUP BY week_day ORDER BY sales DESC;"
+
+- question: "What was the ticket with the highest total?"
+  sql: "SELECT ticket_number, SUM(total) AS total_ticket FROM sales GROUP BY ticket_number ORDER BY total_ticket DESC LIMIT 1;"
+
+- question: "Which waiter generated the most revenue?"
+  sql: "SELECT waiter, SUM(total) AS revenue FROM sales GROUP BY waiter ORDER BY revenue DESC LIMIT 1;"
+
+- question: "How many distinct products were sold?"
+  sql: "SELECT COUNT(DISTINCT product_name) AS distinct_products FROM sales;"
+
+- question: "What is the total sales per day?"
+  sql: "SELECT date, SUM(total) AS daily_total FROM sales GROUP BY date ORDER BY date;"
+
+- question: "What was the total sales in October?"
+  sql: "SELECT SUM(total) AS total_sales FROM sales WHERE EXTRACT(MONTH FROM date) = 10;"
+
+- question: "How many sales were there in November?"
+  sql: "SELECT COUNT(*) AS sales FROM sales WHERE EXTRACT(MONTH FROM date) = 11;"
+
+- question: "At what hour are sales highest?"
+  sql: "SELECT hour, COUNT(*) AS sales FROM sales GROUP BY hour ORDER BY sales DESC LIMIT 5;"
+
+- question: "What was the best-selling product before noon?"
+  sql: "SELECT product_name, SUM(quantity) AS total_qty FROM sales WHERE hour < '12:00' GROUP BY product_name ORDER BY total_qty DESC LIMIT 1;"
+
+- question: "What was the best-selling product in the afternoon?"
+  sql: "SELECT product_name, SUM(quantity) AS total_qty FROM sales WHERE hour >= '12:00' GROUP BY product_name ORDER BY total_qty DESC LIMIT 1;"
+
+- question: "How many sales were there before 10am?"
+  sql: "SELECT COUNT(*) AS sales FROM sales WHERE hour < '10:00';"
+
+- question: "How many sales are made before 4pm?"
+  sql: "SELECT COUNT(*) AS sales FROM sales WHERE hour < '16:00';"
+
+- question: "What is the average price per product?"
+  sql: "SELECT product_name, AVG(unitary_price) AS avg_price FROM sales GROUP BY product_name ORDER BY avg_price DESC;"
+
+- question: "How many units were sold in total?"
+  sql: "SELECT SUM(quantity) AS total_units FROM sales;"
+
+- question: "What was the highest sale of the day?"
+  sql: "SELECT date, MAX(total) AS max_sale FROM sales GROUP BY date ORDER BY max_sale DESC LIMIT 1;"
+
+- question: "How many sales were there in the last recorded month?"
+  sql: "SELECT COUNT(*) AS sales FROM sales WHERE EXTRACT(MONTH FROM date) = (SELECT EXTRACT(MONTH FROM MAX(date)) FROM sales) AND EXTRACT(YEAR FROM date) = (SELECT EXTRACT(YEAR FROM MAX(date)) FROM sales);"
