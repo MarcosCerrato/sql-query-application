@@ -95,6 +95,9 @@ Ollama was chosen over external APIs (OpenAI, Anthropic) to eliminate network de
 ### Central orchestrator (model-service)
 The frontend makes a single call (`POST /ask`) and model-service coordinates the full pipeline internally. This keeps the frontend simple and centralizes retry and cache logic.
 
+### Separate answer-service
+Both tasks use the same model (`qwen2.5-coder:7b`), but keeping answer generation in its own service means it can be scaled or replaced independently — swapping the local Ollama call for an external API, or running a different model, without touching the orchestration logic in model-service.
+
 ### SHA256 cache + 5 min TTL
 The cache key is `SHA256(question + schema columns)`. If the schema changes (via `/refresh-schema`), the cache is automatically invalidated. Avoids redundant LLM calls for repeated questions.
 
