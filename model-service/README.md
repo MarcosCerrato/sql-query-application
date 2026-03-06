@@ -54,25 +54,6 @@ Solo generación de SQL, sin ejecutar.
 
 ---
 
-### `POST /text-to-sql-with-feedback`
-
-Regenera SQL incorporando el error de PostgreSQL como contexto.
-
-**Request:**
-```json
-{
-  "question": "¿Cuánto se vendió el lunes?",
-  "pg_error": "column \"weekday\" does not exist"
-}
-```
-
-**Response:**
-```json
-{ "sql": "SELECT SUM(total) FROM sales WHERE week_day = 'Monday'", "cached": false }
-```
-
----
-
 ### `POST /refresh-schema`
 
 Invalida el cache de schema y SQL. Útil si el schema de la base de datos cambió.
@@ -118,9 +99,7 @@ POST /query {sql} → db-service
      ├── ERROR 400 (SQL inválido)
      │         │
      │         ▼ (hasta 2 reintentos)
-     │   POST /text-to-sql-with-feedback {question, pg_error}
-     │         │
-     │         └──▶ vuelve a POST /query con nuevo SQL
+     │         └──▶ reintenta generate_sql con error_context
      │
      ▼ OK
 POST /answer {question, sql, rows} → answer-service
@@ -224,7 +203,7 @@ poetry run pytest
 ```
 model-service/
 ├── main.py           # FastAPI app factory (crea app, registra router)
-├── router.py         # Endpoints: /ask, /text-to-sql, /text-to-sql-with-feedback, /refresh-schema
+├── router.py         # Endpoints: /ask, /text-to-sql, /refresh-schema
 ├── service.py        # Lógica core: prompt building, Ollama calls, cache, retry
 ├── config.py         # Settings con pydantic-settings
 ├── few_shots.yaml    # 16 ejemplos pregunta→SQL para few-shot prompting

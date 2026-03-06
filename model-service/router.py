@@ -30,11 +30,6 @@ class TextToSQLResponse(BaseModel):
     cached: bool = False
 
 
-class FeedbackRequest(BaseModel):
-    question: str
-    pg_error: str  # error returned by db-service on previous attempt
-
-
 class AskResponse(BaseModel):
     answer: str
     sql: str
@@ -95,36 +90,6 @@ async def text_to_sql(req: QuestionRequest, request: Request):
     return TextToSQLResponse(sql=sql)
 
 
-@router.post("/text-to-sql-with-feedback", response_model=TextToSQLResponse)
-async def text_to_sql_with_feedback(req: FeedbackRequest, request: Request):
-    """Re-generate SQL given a PostgreSQL execution error from a previous attempt."""
-    schema = request.app.state.schema
-    few_shots = request.app.state.few_shots
-    client: httpx.AsyncClient = request.app.state.http_client
-    relevant_shots = select_few_shots(req.question, few_shots)
-
-    t0 = time.time()
-    log_event("INFO", "text_to_sql_feedback",
-              question=req.question, pg_error=req.pg_error)
-
-    try:
-        sql = await generate_sql(
-            client, req.question, schema, relevant_shots,
-            error_context=f"The query failed with: {req.pg_error}",
-        )
-    except httpx.HTTPStatusError as e:
-        log_event("ERROR", "ollama_error", detail=e.response.text)
-        raise HTTPException(status_code=502, detail="Ollama error")
-    except httpx.RequestError:
-        log_event("ERROR", "ollama_unreachable")
-        raise HTTPException(status_code=502, detail="Ollama unreachable")
-
-    latency_ms = int((time.time() - t0) * 1000)
-    log_event("INFO", "text_to_sql_feedback_ok",
-              question=req.question, sql=sql, latency_ms=latency_ms)
-    return TextToSQLResponse(sql=sql)
-
-
 @router.post("/refresh-schema", status_code=200)
 async def refresh_schema(request: Request):
     client: httpx.AsyncClient = request.app.state.http_client
@@ -145,9 +110,14 @@ async def ask(req: QuestionRequest, request: Request):
     client: httpx.AsyncClient = request.app.state.http_client
     relevant_shots = select_few_shots(req.question, few_shots)
 
+    key = _cache_key(req.question, schema)
+    cached_sql = cache_get(key)
+    if cached_sql:
+        log_event("INFO", "cache_hit", question=req.question, sql=cached_sql)
+
     t0 = time.time()
     try:
-        sql = await generate_sql(client, req.question, schema, relevant_shots)
+        sql = cached_sql or await generate_sql(client, req.question, schema, relevant_shots)
     except HTTPException as e:
         if e.detail == "NOT_APPLICABLE":
             return AskResponse(
@@ -181,6 +151,8 @@ async def ask(req: QuestionRequest, request: Request):
         result.raise_for_status()
 
         rows = result.json()["rows"]
+        if not cached_sql:
+            cache_set(key, sql)
         answer = await call_answer_service(client, req.question, sql, rows)
 
     except HTTPException:

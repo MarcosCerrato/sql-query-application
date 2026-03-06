@@ -44,7 +44,7 @@ A Dockerized system that lets you query an Argentine bakery sales database using
 │     Port 8000       │   │         Port 8002           │
 │  SQL execution      │   │  Natural language response  │
 │  SELECT-only        │   │  (qwen2.5-coder:7b)         │
-│  LIMIT auto-inject  │   │  Deterministic fallback     │
+│  LIMIT auto-inject  │   │                             │
 └────────┬────────────┘   └──────────────┬──────────────┘
          │                               │
          ▼                               ▼
@@ -110,8 +110,8 @@ db-service rejects any query that is not a SELECT (regex whitelist). Protects th
 ### Automatic LIMIT
 If the SQL does not include LIMIT, db-service injects `LIMIT 1000` before executing. Protects against queries that would return millions of rows.
 
-### Deterministic fallback in answer-service
-If the answer LLM produces a hallucination (an invented number) or garbled output (doesn't cover the key values), the response is discarded and a deterministic bullet-point format is used with the real data.
+### Chat-first UI design
+The frontend is intentionally built as a chat interface (sidebar with conversation history + message bubbles) rather than a simple input/output form. Today each question is stateless — the model receives no context from previous turns. This is a deliberate scope decision: the chat shape is the right long-term interface for a natural language query tool, and building it now means adding conversational memory later requires only backend changes, not a UI redesign. See [Scalability → Conversational context](#6-conversational-context) for the planned evolution.
 
 ---
 
@@ -139,7 +139,6 @@ Example: *"What is the best-selling product?"*
 
 5. model-service → POST /answer {question, sql, rows} → answer-service
    answer-service calls Ollama (qwen2.5-coder:7b) → natural text
-   (If hallucination or garbled: fallback to bullet-points)
 
 6. model-service → Frontend: {answer, sql, rows}
 
@@ -159,8 +158,9 @@ Example: *"What is the best-selling product?"*
 ### First start
 
 ```bash
-# Clone the repository and enter the directory
-cd "Take-Home Assignment_ SQL Query Application"
+# Clone the repository
+git clone https://github.com/MarcosCerrato/sql-query-application.git
+cd sql-query-application
 
 # Start everything (first time: downloads models ~5-10 min)
 docker compose up --build
@@ -169,7 +169,7 @@ docker compose up --build
 open http://localhost:5173
 ```
 
-On the first run, the `ollama` container downloads both models automatically before the other services start (healthchecks enforce the startup order).
+On the first run, the `ollama` container downloads the model automatically before the other services start (healthchecks enforce the startup order).
 
 ### Verify all services are healthy
 
@@ -186,16 +186,6 @@ OLLAMA_MODEL=codellama:7b docker compose up
 
 # Change both models
 OLLAMA_MODEL=qwen2.5-coder:14b OLLAMA_ANSWER_MODEL=qwen2.5-coder:14b docker compose up
-```
-
-### Running without Docker (development)
-
-Each service can be run with Poetry:
-
-```bash
-cd db-service
-poetry install
-poetry run uvicorn main:app --reload --port 8000
 ```
 
 ---
@@ -249,7 +239,6 @@ poetry run uvicorn main:app --reload --port 8000
 |----------|--------|-------------|
 | `/ask` | POST | Full pipeline: NL → SQL → execution → NL response |
 | `/text-to-sql` | POST | SQL generation only (without executing) |
-| `/text-to-sql-with-feedback` | POST | Regenerates SQL with a PostgreSQL error as context |
 | `/refresh-schema` | POST | Invalidates cache and re-fetches schema from db-service |
 | `/health` | GET | Service status |
 
@@ -330,7 +319,7 @@ python run_eval.py  # Runs the 16 questions against the live system
 | `columns_match` | 25% | Returned columns match the expected ones |
 | `row_count_match` | 20% | Row count is exact |
 | `no_hallucination` | 15% | The response does not invent numbers |
-| `not_garbled` | 10% | The response covers the key values |
+| `not_garbled` | 10% | The response covers the key values (checked externally in eval) |
 
 See `eval/README.md` for more detail.
 
@@ -338,37 +327,53 @@ See `eval/README.md` for more detail.
 
 ## Scalability
 
-### 1. Larger schemas and more tables
+### 1. Database optimization
 
-**Current bottleneck:** The entire DB schema (column names, types, 5 sample values) is injected verbatim into every prompt via `fetch_schema` in `model-service/service.py`. With multiple tables or dozens of columns, the prompt grows beyond model context limits and degrades SQL quality.
+`db-service` opens one PostgreSQL connection per request and runs every query against a single unindexed table. This is fine at the current scale (24,212 rows) but degrades predictably as data and concurrency grow.
 
-**Recommendations:**
+- **Indexing:** The `sales` table has no indexes today. High-frequency filter columns (`date`, `product_name`, `waiter`) should be indexed. A composite index on `(date, product_name)` would accelerate the most common aggregation patterns — GROUP BY product over a date range. Alembic already manages schema versions, so adding indexes is a one-line migration.
+- **Connection pooling with PgBouncer:** Under concurrent load, `db-service` exhausts PostgreSQL's connection limit quickly (default: 100). Adding PgBouncer in front of Postgres in transaction pooling mode multiplexes hundreds of application connections into a small pool, with no changes to application code.
+- **Redis cache for frequent queries:** The current in-memory cache (`_cache` dict in `model-service/service.py`, TTL = 300 s) only covers LLM generation. Frequently repeated questions could also cache the final SQL result in Redis, skipping both the LLM call and the DB round-trip. The cache key `SHA256(question + schema)` is already collision-safe and shared-nothing, so it maps directly to a Redis key.
 
-- **Schema-aware retrieval (RAG):** Embed table and column descriptions with a vector model (e.g. `nomic-embed-text` via Ollama). On each query, retrieve only the relevant tables using pgvector or Qdrant. The `fetch_schema` function in `model-service/service.py` would be replaced by a semantic lookup, keeping prompt size constant regardless of schema growth.
-- **Semantic few-shot selection:** Replace the current keyword-overlap selection (`select_few_shots` in `service.py`) with cosine similarity over embedded question vectors. This scales to hundreds of examples without degrading prompt quality — the current keyword approach breaks down as the example set grows.
-- **Business metadata layer:** Extend `few_shots.yaml` with per-column natural language descriptions and join hints. Allows the LLM to reason across foreign keys without seeing all rows.
+### 2. Load balancing and service scaling
 
-### 2. High frontend traffic
+`model-service` and `answer-service` are both stateless FastAPI containers — they hold no session state and their only shared resource is the in-memory cache dict. This makes horizontal scaling straightforward.
 
-**Current bottleneck:** `model-service` runs as a single container with an in-memory Python dict as cache (`_cache` in `service.py`, TTL = 300 s). Under concurrent load, LLM calls are sequential (Ollama processes one request at a time by default) and the cache is not shared across replicas.
+- **Horizontal scaling:** Deploy multiple replicas of `model-service` and `answer-service` behind nginx or Traefik. The only prerequisite is externalizing the cache (see Redis above), since each replica currently has its own isolated `_cache` dict and would bypass each other's cached results.
+- **Kubernetes with autoscaling:** In a production environment, deploying the microservices on Kubernetes with Horizontal Pod Autoscaler (HPA) rules on CPU or request queue depth lets the cluster scale replicas up during traffic spikes and back down during idle periods — without manual intervention.
+- **Ollama as the real bottleneck:** LLM inference (~15–30 s on CPU) dominates end-to-end latency. Scaling `model-service` replicas without also scaling Ollama shifts the bottleneck without solving it. Multiple Ollama instances behind a load balancer — each with the model loaded in memory — allow parallel inference requests.
 
-**Recommendations:**
+### 3. Efficient model inference
 
-- **Horizontal scaling + load balancer:** Deploy multiple replicas of `model-service` and `answer-service` behind nginx or Traefik. Both services are stateless (no local DB, no state beyond the in-memory cache dict) so scaling out is straightforward once the cache is externalized.
-- **Distributed cache (Redis):** Replace the `_cache` dict in `service.py` with Redis. The cache key is already `SHA256(question + schema)`, so it is safe to share across replicas. TTL behavior is preserved with Redis `SETEX`.
-- **Async LLM job queue:** Wrap Ollama calls in Celery or RQ. The `/ask` endpoint returns a job ID immediately; the frontend polls or listens via SSE for the result. This prevents timeouts under load and gives users real-time "generating…" feedback — the UI already renders intermediate states.
-- **PostgreSQL connection pooling:** Add PgBouncer in front of Postgres. `db-service` opens one connection per request; under high load this exhausts the connection pool. PgBouncer multiplexes connections transparently with no application-level changes.
+Ollama runs `qwen2.5-coder:7b` as a single-process server with no request batching. Requests queue sequentially, so latency scales linearly with concurrent users.
 
-### 3. LLM layer
+- **GPU acceleration:** Moving Ollama to a machine with a GPU (e.g., A10G, 24 GB VRAM) brings inference from ~25–30 s to ~2–5 s per query — a 5–10× speedup with no code changes. The Docker Compose setup already supports the Ollama GPU runtime via the `deploy` block.
+- **vLLM for production throughput:** Replace the `ollama` container with vLLM, which implements continuous batching and PagedAttention memory management. This allows multiple concurrent requests to share GPU compute rather than queue sequentially. The `call_ollama()` function in `model-service/service.py` would only need its endpoint URL updated, since vLLM exposes an OpenAI-compatible API.
+- **Model distillation / smaller model for simple queries:** Not all queries need a 7B model. A lightweight router could classify incoming questions as simple (direct aggregation, single filter) or complex (multi-condition, subquery, date arithmetic) and route easy ones to a smaller, faster model (e.g., `qwen2.5-coder:3b`). Based on benchmarks from similar tasks, a 3B model handles straightforward aggregations correctly at roughly 2.5× the speed.
+- **External API as overflow:** When local Ollama is saturated, `call_ollama()` in `service.py` could fall back to an external provider (OpenAI, Anthropic) based on a response-time threshold. The model call is already fully isolated in that function, so adding a fallback path requires no architectural changes.
 
-**Current bottleneck:** Ollama is single-process with no request batching. Concurrent LLM calls queue sequentially, so latency grows linearly with traffic. There is also no overflow path when the local model is saturated.
+### 4. Asynchronous processing
 
-**Recommendations:**
+LLM generation (~15–30 s) makes synchronous HTTP calls fragile under load — connections time out, and users get no feedback during processing.
 
-- **vLLM for production:** Replace the `ollama` container with vLLM, which supports continuous batching and PagedAttention. The Ollama API interface (`/api/generate`) can be swapped for vLLM's OpenAI-compatible endpoint with minimal changes to `call_ollama()` in `service.py`.
-- **GPU in cloud:** For production, a single A10G (24 GB VRAM) can serve `qwen2.5-coder:7b` at ~200 tokens/s — roughly 10× faster than CPU inference. The local Docker Compose setup remains unchanged for development.
-- **OpenAI/Anthropic as overflow:** Route to an external API when local Ollama is saturated (response time > threshold). This is already supported by the architecture since all model calls are isolated in `call_ollama()` in `service.py`.
-- **Domain fine-tuning:** Use validated (question, SQL) pairs from the `eval/` framework to fine-tune `qwen2.5-coder:7b`. A fine-tuned 7B model typically outperforms a generic 70B on a specific schema, with lower latency and memory footprint.
+- **Job queue with Kafka or Celery:** Offload `call_ollama()` calls to background workers. The `/ask` endpoint would return a job ID immediately; the frontend polls a `/result/{job_id}` endpoint or connects via Server-Sent Events (SSE) for a streaming response. The React frontend already renders intermediate states ("generating…"), making this a UI-compatible change.
+
+### 5. Logging and monitoring
+
+The current system has no observability layer. In production, silent failures (hallucinations, slow queries, Ollama timeouts) would be invisible.
+
+- **Prometheus + Grafana:** Instrument each FastAPI service with `prometheus-fastapi-instrumentator` to expose request latency, error rates, and queue depth as metrics. A Grafana dashboard would surface the LLM latency distribution, SQL validity rate over time, and cache hit ratio — making it straightforward to detect regressions after model or prompt changes.
+- **Structured logging:** Replace plain `print` statements with structured JSON logs (e.g., via Python's `logging` module + `python-json-logger`). Each log entry would include `question_hash`, `service`, `latency_ms`, and `sql_valid` — enabling log-based alerting in tools like Loki or CloudWatch.
+- **Alerting:** Set threshold alerts on error rate (e.g., >10% SQL validation failures in 5 min) and P95 latency (e.g., >45 s end-to-end). These would catch model regressions, database connectivity issues, or traffic spikes before users notice.
+
+### 6. Conversational context
+
+The frontend is already shaped as a chat (message history, bubbles, sidebar). What's missing is the backend treating that history as context. Today every `/ask` call is fully stateless — the model has no memory of previous turns in the same session.
+
+- **Session-scoped conversation history:** Assign a `session_id` (UUID) to each chat session on the frontend. Include the last N question/answer pairs in the prompt sent to `call_ollama()`. This allows follow-up questions like "filter that by Monday" to resolve against the previous query without the user repeating themselves.
+- **Multi-request result management:** With conversation history, the frontend can display results from multiple queries in the same session side by side or as a scrollable thread — each bubble showing its own SQL block and results table. The `MessageBubble`, `SQLBlock`, and `ResultsTable` components are already independent, making this a compositional change rather than a redesign.
+- **Persistent sessions:** Store conversation history in Redis (keyed by `session_id`) with a TTL matching the user's expected session length. This makes sessions survive page refreshes and allows the backend to scale horizontally without losing context, since the state lives in a shared store rather than in-process memory.
+- **Context window management:** As conversation grows, older turns must be summarized or dropped to stay within the model's context limit. A sliding window (keep last 5 turns) or a lightweight summarization step before each call would handle this transparently.
 
 ---
 
