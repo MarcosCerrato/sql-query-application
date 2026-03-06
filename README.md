@@ -329,51 +329,46 @@ See `eval/README.md` for more detail.
 
 ### 1. Database optimization
 
-`db-service` opens one PostgreSQL connection per request and runs every query against a single unindexed table. This is fine at the current scale (24,212 rows) but degrades predictably as data and concurrency grow.
+`db-service` opens one connection per request against a single unindexed table — fine at 24k rows but degrades under load.
 
-- **Indexing:** The `sales` table has no indexes today. High-frequency filter columns (`date`, `product_name`, `waiter`) should be indexed. A composite index on `(date, product_name)` would accelerate the most common aggregation patterns — GROUP BY product over a date range. Alembic already manages schema versions, so adding indexes is a one-line migration.
-- **Connection pooling with PgBouncer:** Under concurrent load, `db-service` exhausts PostgreSQL's connection limit quickly (default: 100). Adding PgBouncer in front of Postgres in transaction pooling mode multiplexes hundreds of application connections into a small pool, with no changes to application code.
-- **Redis cache for frequent queries:** The current in-memory cache (`_cache` dict in `model-service/service.py`, TTL = 300 s) only covers LLM generation. Frequently repeated questions could also cache the final SQL result in Redis, skipping both the LLM call and the DB round-trip. The cache key `SHA256(question + schema)` is already collision-safe and shared-nothing, so it maps directly to a Redis key.
+- **Indexing:** Columns like `date`, `product_name`, and `waiter` are common filters with no indexes today. A one-line Alembic migration fixes this.
+- **Connection pooling:** PgBouncer in front of Postgres would multiplex concurrent connections without touching application code.
+- **Redis cache:** The current in-memory cache covers LLM generation only. Moving it to Redis would also cache SQL results, and naturally supports horizontal scaling since the cache becomes shared across replicas.
 
 ### 2. Load balancing and service scaling
 
-`model-service` and `answer-service` are both stateless FastAPI containers — they hold no session state and their only shared resource is the in-memory cache dict. This makes horizontal scaling straightforward.
-
-- **Horizontal scaling:** Deploy multiple replicas of `model-service` and `answer-service` behind nginx or Traefik. The only prerequisite is externalizing the cache (see Redis above), since each replica currently has its own isolated `_cache` dict and would bypass each other's cached results.
-- **Kubernetes with autoscaling:** In a production environment, deploying the microservices on Kubernetes with Horizontal Pod Autoscaler (HPA) rules on CPU or request queue depth lets the cluster scale replicas up during traffic spikes and back down during idle periods — without manual intervention.
-- **Ollama as the real bottleneck:** LLM inference (~15–30 s on CPU) dominates end-to-end latency. Scaling `model-service` replicas without also scaling Ollama shifts the bottleneck without solving it. Multiple Ollama instances behind a load balancer — each with the model loaded in memory — allow parallel inference requests.
+`model-service` and `answer-service` are stateless — the only prerequisite for running multiple replicas is externalizing the in-memory cache (see Redis above). The real bottleneck is Ollama: LLM inference (~15–30 s on CPU) means scaling the API replicas without scaling Ollama just shifts the queue elsewhere.
 
 ### 3. Efficient model inference
 
-Ollama runs `qwen2.5-coder:7b` as a single-process server with no request batching. Requests queue sequentially, so latency scales linearly with concurrent users.
+Ollama runs as a single-process server with no request batching — latency scales linearly with concurrent users (~25–30 s on CPU).
 
-- **GPU acceleration:** Moving Ollama to a machine with a GPU (e.g., A10G, 24 GB VRAM) brings inference from ~25–30 s to ~2–5 s per query — a 5–10× speedup with no code changes. The Docker Compose setup already supports the Ollama GPU runtime via the `deploy` block.
-- **vLLM for production throughput:** Replace the `ollama` container with vLLM, which implements continuous batching and PagedAttention memory management. This allows multiple concurrent requests to share GPU compute rather than queue sequentially. The `call_ollama()` function in `model-service/service.py` would only need its endpoint URL updated, since vLLM exposes an OpenAI-compatible API.
-- **Model distillation / smaller model for simple queries:** Not all queries need a 7B model. A lightweight router could classify incoming questions as simple (direct aggregation, single filter) or complex (multi-condition, subquery, date arithmetic) and route easy ones to a smaller, faster model (e.g., `qwen2.5-coder:3b`). Based on benchmarks from similar tasks, a 3B model handles straightforward aggregations correctly at roughly 2.5× the speed.
-- **External API as overflow:** When local Ollama is saturated, `call_ollama()` in `service.py` could fall back to an external provider (OpenAI, Anthropic) based on a response-time threshold. The model call is already fully isolated in that function, so adding a fallback path requires no architectural changes.
+- **GPU acceleration:** An NVIDIA GPU (e.g., A10G) brings inference to ~2–5 s with no code changes. Docker Compose already supports the Ollama GPU runtime via the `deploy` block.
+- **vLLM:** Replacing Ollama with vLLM enables continuous batching and PagedAttention, allowing concurrent requests to share GPU compute. The switch requires only updating the endpoint URL in `model-service/service.py`, since vLLM exposes an OpenAI-compatible API.
+- **Model routing:** Not every query needs a 7B model. A simple classifier could route straightforward aggregations to a faster 3B model and reserve the 7B for complex multi-condition queries.
+- **External API fallback:** When Ollama is saturated, `generate_sql()` in `service.py` could fall back to an external provider (OpenAI, Anthropic). The LLM call is already isolated in that function, so adding a fallback requires minimal changes.
 
 ### 4. Asynchronous processing
 
-LLM generation (~15–30 s) makes synchronous HTTP calls fragile under load — connections time out, and users get no feedback during processing.
+LLM generation (~15–30 s) makes synchronous requests fragile under load — connections time out and users get no feedback.
 
-- **Job queue with Kafka or Celery:** Offload `call_ollama()` calls to background workers. The `/ask` endpoint would return a job ID immediately; the frontend polls a `/result/{job_id}` endpoint or connects via Server-Sent Events (SSE) for a streaming response. The React frontend already renders intermediate states ("generating…"), making this a UI-compatible change.
+- **Job queue (Celery/Kafka):** The `/ask` endpoint could return a job ID immediately and let the frontend poll or receive results via SSE. The frontend already renders a loading state, so this would be a backend-only change.
 
 ### 5. Logging and monitoring
 
-The current system has no observability layer. In production, silent failures (hallucinations, slow queries, Ollama timeouts) would be invisible.
+The system currently has no observability layer — slow queries, Ollama timeouts, and SQL failures are invisible in production.
 
-- **Prometheus + Grafana:** Instrument each FastAPI service with `prometheus-fastapi-instrumentator` to expose request latency, error rates, and queue depth as metrics. A Grafana dashboard would surface the LLM latency distribution, SQL validity rate over time, and cache hit ratio — making it straightforward to detect regressions after model or prompt changes.
-- **Structured logging:** Replace plain `print` statements with structured JSON logs (e.g., via Python's `logging` module + `python-json-logger`). Each log entry would include `question_hash`, `service`, `latency_ms`, and `sql_valid` — enabling log-based alerting in tools like Loki or CloudWatch.
-- **Alerting:** Set threshold alerts on error rate (e.g., >10% SQL validation failures in 5 min) and P95 latency (e.g., >45 s end-to-end). These would catch model regressions, database connectivity issues, or traffic spikes before users notice.
+- **Prometheus + Grafana:** `prometheus-fastapi-instrumentator` exposes latency and error rate metrics per service with minimal setup.
+- **Structured logging:** Replacing the current `log_event()` print-based approach with JSON logs (e.g., `python-json-logger`) would make entries queryable in Loki or CloudWatch — each log already includes `question`, `sql`, and `latency_ms`.
+- **Alerting:** Thresholds on SQL error rate (>10% in 5 min) and P95 latency (>45 s) would catch model regressions and infrastructure issues before users notice.
 
 ### 6. Conversational context
 
-The frontend is already shaped as a chat (message history, bubbles, sidebar). What's missing is the backend treating that history as context. Today every `/ask` call is fully stateless — the model has no memory of previous turns in the same session.
+Every `/ask` call is stateless — the model has no memory of previous turns. The chat UI already supports the right shape for multi-turn interaction; what's missing is the backend.
 
-- **Session-scoped conversation history:** Assign a `session_id` (UUID) to each chat session on the frontend. Include the last N question/answer pairs in the prompt sent to `call_ollama()`. This allows follow-up questions like "filter that by Monday" to resolve against the previous query without the user repeating themselves.
-- **Multi-request result management:** With conversation history, the frontend can display results from multiple queries in the same session side by side or as a scrollable thread — each bubble showing its own SQL block and results table. The `MessageBubble`, `SQLBlock`, and `ResultsTable` components are already independent, making this a compositional change rather than a redesign.
-- **Persistent sessions:** Store conversation history in Redis (keyed by `session_id`) with a TTL matching the user's expected session length. This makes sessions survive page refreshes and allows the backend to scale horizontally without losing context, since the state lives in a shared store rather than in-process memory.
-- **Context window management:** As conversation grows, older turns must be summarized or dropped to stay within the model's context limit. A sliding window (keep last 5 turns) or a lightweight summarization step before each call would handle this transparently.
+- **Session history in the prompt:** Attach a `session_id` to each chat and include the last N question/answer pairs in the LLM prompt. This enables follow-up questions like "filter that by Monday" without the user repeating context.
+- **Persistent sessions in Redis:** Store conversation history keyed by `session_id` with a TTL. Sessions survive page refreshes and the approach works across multiple `model-service` replicas.
+- **Context window management:** As conversations grow, a sliding window (last 5 turns) or lightweight summarization step prevents the prompt from exceeding the model's context limit.
 
 ---
 
