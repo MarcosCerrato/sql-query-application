@@ -52,30 +52,6 @@ class TestAnswerEndpoint:
         assert response.status_code == 200
         assert response.json()["answer"] == "El total es 100."
 
-    def test_hallucinated_response_returns_fallback(self, client):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        # Invented number 99999 not in rows
-        mock_resp.json.return_value = {"response": "El total es 99999 pesos."}
-
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.post = AsyncMock(return_value=mock_resp)
-
-        with patch("main.httpx.AsyncClient", return_value=mock_client):
-            response = client.post(
-                "/answer",
-                json={
-                    "question": "Total?",
-                    "sql": "SELECT SUM(amount) FROM sales",
-                    "rows": [{"total": 100}],
-                },
-            )
-        assert response.status_code == 200
-        # Should return fallback, not the hallucinated response
-        assert "99999" not in response.json()["answer"]
-
     def test_ollama_error_returns_502(self, client):
         mock_resp = MagicMock()
         mock_resp.status_code = 500

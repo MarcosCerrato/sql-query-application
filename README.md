@@ -304,24 +304,9 @@ Backend tests use mocks for Ollama and an in-memory SQLite database to isolate e
 
 ## Model evaluation
 
-The `eval/` directory contains a framework to measure end-to-end system quality.
+Model selection was informed by an offline evaluation across multiple model combinations (different SQL generation and answer models), scored against a fixed set of 26 questions covering aggregations, filters, date/time queries, and multi-language input. Each question was scored on SQL validity, column match, row count accuracy, and answer quality.
 
-```bash
-cd eval
-python run_eval.py  # Runs the 16 questions against the live system
-```
-
-**Scoring per question (100 points):**
-
-| Metric | Weight | Description |
-|--------|--------|-------------|
-| `sql_valid` | 30% | The endpoint returns no error |
-| `columns_match` | 25% | Returned columns match the expected ones |
-| `row_count_match` | 20% | Row count is exact |
-| `no_hallucination` | 15% | The response does not invent numbers |
-| `not_garbled` | 10% | The response covers the key values (checked externally in eval) |
-
-See `eval/README.md` for more detail.
+`qwen2.5-coder:7b` was chosen for both tasks based on those results — it consistently produced valid SQL and handled Spanish and English questions correctly. The eval framework lives in `eval/` and can be rerun against a live stack.
 
 ---
 
