@@ -332,7 +332,6 @@ Model selection was informed by an offline evaluation across multiple model comb
 Ollama runs as a single-process server with no request batching — latency scales linearly with concurrent users (~25–30 s on CPU).
 
 - **GPU acceleration:** An NVIDIA GPU (e.g., A10G) brings inference to ~2–5 s with no code changes. Docker Compose already supports the Ollama GPU runtime via the `deploy` block.
-- **vLLM:** Replacing Ollama with vLLM enables continuous batching and PagedAttention, allowing concurrent requests to share GPU compute. The switch requires only updating the endpoint URL in `model-service/service.py`, since vLLM exposes an OpenAI-compatible API.
 - **Model routing:** Not every query needs a 7B model. A simple classifier could route straightforward aggregations to a faster 3B model and reserve the 7B for complex multi-condition queries.
 - **External API fallback:** When Ollama is saturated, `generate_sql()` in `service.py` could fall back to an external provider (OpenAI, Anthropic). The LLM call is already isolated in that function, so adding a fallback requires minimal changes.
 
